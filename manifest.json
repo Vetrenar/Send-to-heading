@@ -1,0 +1,11 @@
+{
+	"id": "send-to-Heading",
+	"name": "Send to Heading",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Quickly moves the paragraph under the cursor to a specific heading using a floating search bar.",
+	"author": "Vetrenar",
+	"authorUrl": "https://github.com/Vetrenar/Send-to-heading",
+	"isDesktopOnly": false
+
+}
