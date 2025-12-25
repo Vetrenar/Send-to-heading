@@ -1,84 +1,78 @@
 import { 
-    App, 
-    Editor, 
-    MarkdownView, 
-    Plugin, 
-    Notice,
-    TFile,
-    HeadingCache
+    App, Editor, MarkdownView, Plugin, Notice, TFile, 
+    HeadingCache, PluginSettingTab, Setting, TAbstractFile 
 } from 'obsidian';
 
-// --- Settings ---
 interface TextSorterSettings {
     showFloatingBar: boolean;
     barLeft: number;
     barTop: number;
     targetFilePath: string | null;
+    useCustomFormatting: boolean;
+    mdTemplate: string;
+    pdfTemplate: string;
+    webTemplate: string;
 }
 
 const DEFAULT_SETTINGS: TextSorterSettings = {
     showFloatingBar: true,
     barLeft: 20,
     barTop: 80,
-    targetFilePath: null
+    targetFilePath: null,
+    useCustomFormatting: true,
+    mdTemplate: "{{text}} (Source: [[{{file}}]])",
+    pdfTemplate: "{{text}} (Source: [[{{file}}#page={{page}}]])",
+    webTemplate: "{{text}} (Source: [Web]({{url}}))"
 };
 
-// --- Main Plugin ---
 export default class TextSorterPlugin extends Plugin {
     settings: TextSorterSettings;
     floatingBar: SortingFloatingBar;
-    
     activeTargetHeading: string | null = null; 
 
     async onload() {
         await this.loadSettings();
+        this.addSettingTab(new TextSorterSettingTab(this.app, this));
 
-        // 1. Initialize UI
         this.floatingBar = new SortingFloatingBar(this);
 
-        // 2. Command: Toggle Bar
+        // 1) ADD COMMANDS FOR HOTKEYS
         this.addCommand({
             id: 'toggle-sorter-bar',
             name: 'Show/Hide sorting bar',
-            callback: () => {
-                const newState = !this.settings.showFloatingBar;
-                this.floatingBar.toggle(newState);
-                new Notice(newState ? "Sorting bar shown" : "Sorting bar hidden");
-            }
+            callback: () => this.floatingBar.toggle(!this.settings.showFloatingBar)
         });
 
-        // 3. Events
-        this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
-            this.floatingBar.refreshHeadings();
-        }));
-        
-        this.registerEvent(this.app.metadataCache.on('changed', (file) => {
-            const activeFile = this.app.workspace.getActiveFile();
-            if (activeFile === file || this.settings.targetFilePath === file.path) {
-                this.floatingBar.refreshHeadings();
-            }
-        }));
+        this.addCommand({
+            id: 'send-smart',
+            name: 'Send selection/line to target heading',
+            callback: () => this.handleTransfer('smart')
+        });
 
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            if (this.settings.targetFilePath === oldPath) {
+        this.addCommand({
+            id: 'send-clipboard',
+            name: 'Send clipboard to target heading',
+            callback: () => this.handleTransfer('clipboard')
+        });
+
+        // Watch for file renames to keep target locked
+        this.registerEvent(this.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => {
+            if (oldPath === this.settings.targetFilePath) {
                 this.settings.targetFilePath = file.path;
                 this.saveSettings();
                 this.floatingBar.refreshHeadings();
             }
         }));
 
-        this.registerEvent(this.app.vault.on('delete', (file) => {
-            if (this.settings.targetFilePath === file.path) {
-                this.settings.targetFilePath = null;
-                this.saveSettings();
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => this.floatingBar.refreshHeadings()));
+        this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+            if (file.path === this.settings.targetFilePath || file === this.app.workspace.getActiveFile()) {
                 this.floatingBar.refreshHeadings();
             }
         }));
 
         this.app.workspace.onLayoutReady(() => {
-            if (this.settings.showFloatingBar) {
-                this.floatingBar.toggle(true, false);
-            }
+            if (this.settings.showFloatingBar) this.floatingBar.toggle(true, false);
         });
     }
 
@@ -86,262 +80,208 @@ export default class TextSorterPlugin extends Plugin {
         this.floatingBar.clearUI();
     }
 
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    }
+    async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
+    async saveSettings() { await this.saveData(this.settings); }
 
-    async saveSettings() {
-        await this.saveData(this.settings);
-    }
+    // 2) ACTUAL FORMATTING LOGIC USING {{text}}
+    async formatOutput(rawText: string, activeView: any): Promise<string> {
+        if (!this.settings.useCustomFormatting || !activeView) return rawText;
 
-    // --- Core Logic ---
-    getHeadings(file: TFile | null): HeadingCache[] {
-        if (!file || file.extension !== 'md') return [];
-        const cache = this.app.metadataCache.getFileCache(file);
-        return cache?.headings || [];
-    }
+        const viewType = activeView.getViewType();
 
-    // Used by Clipboard Button
-    async sendClipboardToHeading(targetHeadingName: string) {
-        const text = await navigator.clipboard.readText();
-        if (!text || text.trim() === "") {
-            new Notice("Clipboard is empty.");
-            return;
+        if (["web-viewer", "webviewer", "webview", "surfer-view"].includes(viewType)) {
+            const url = activeView.getState()?.url || activeView.url;
+            return this.settings.webTemplate
+                .replace("{{text}}", rawText)
+                .replace("{{url}}", url || "");
+        }
+
+        if (viewType === "pdf") {
+            const file = activeView.file;
+            const internalViewer = activeView.viewer?.child?.pdfViewer?.pdfViewer;
+            const page = internalViewer?._location?.pageNumber || internalViewer?.currentPageNumber || activeView.getState()?.page || 1;
+
+            if (file instanceof TFile) {
+                return this.settings.pdfTemplate
+                    .replace("{{text}}", rawText)
+                    .replace("{{file}}", file.path)
+                    .replace("{{page}}", page.toString());
+            }
+        }
+
+        if (viewType === "markdown") {
+            const file = activeView.file;
+            if (file instanceof TFile) {
+                return this.settings.mdTemplate
+                    .replace("{{text}}", rawText)
+                    .replace("{{file}}", file.path);
+            }
         }
         
-        // Clipboard is always just an "Insert", no deletion needed
-        await this.transferTextOnly(targetHeadingName, text);
+        return rawText;
     }
 
-    // Used by Move (Arrow) Button
-    async moveParagraphToHeadingName(editor: Editor, view: MarkdownView, targetHeadingName: string) {
-        const cursor = editor.getCursor();
-        const sourceLineNum = cursor.line;
-        const textToMove = editor.getLine(sourceLineNum);
-
-        if (!textToMove || !textToMove.trim()) {
-            new Notice("Current line is empty.");
+    async handleTransfer(type: 'clipboard' | 'smart') {
+        const activeLeaf = this.app.workspace.getMostRecentLeaf();
+        const activeView = activeLeaf?.view as any;
+        
+        if (!this.activeTargetHeading) {
+            new Notice("No target heading selected.");
             return;
         }
 
-        // 1. Determine Target File
+        let extractedText = "";
+
+        if (type === 'clipboard') {
+            extractedText = await navigator.clipboard.readText();
+        } else if (type === 'smart') {
+            const viewType = activeView?.getViewType();
+            
+            if (viewType === "pdf") {
+                extractedText = activeView.viewer?.child?.pdfViewer?.pdfViewer?.textSelectionManager?.getSelectedText() || "";
+                if (!extractedText) extractedText = window.getSelection()?.toString() || "";
+            } 
+            else if (["web-viewer", "webviewer", "webview", "surfer-view"].includes(viewType)) {
+                const webviewEl = activeView.contentEl.querySelector('webview');
+                if (webviewEl && webviewEl.executeJavaScript) {
+                    try {
+                        extractedText = await webviewEl.executeJavaScript('window.getSelection().toString()');
+                    } catch (e) { console.error("Webview JS failed", e); }
+                }
+                if (!extractedText || !extractedText.trim()) {
+                    extractedText = await navigator.clipboard.readText();
+                }
+            }
+            else if (viewType === "markdown") {
+                const isReadingMode = activeView.getMode() === "preview";
+                const editor = activeView.editor as Editor;
+                
+                if (isReadingMode) {
+                    extractedText = window.getSelection()?.toString() || "";
+                } else {
+                    const selection = editor.getSelection();
+                    if (selection && selection.trim().length > 0) {
+                        // MODE: Move Selection
+                        const formatted = await this.formatOutput(selection, activeView);
+                        const success = await this.processTransfer(this.activeTargetHeading, formatted);
+                        if (success) editor.replaceSelection("");
+                        return;
+                    } else {
+                        // MODE: Move Line
+                        const lineNum = editor.getCursor().line;
+                        const lineText = editor.getLine(lineNum);
+                        if (lineText.trim()) {
+                            const formatted = await this.formatOutput(lineText, activeView);
+                            const success = await this.processTransfer(this.activeTargetHeading, formatted);
+                            if (success) {
+                                editor.replaceRange("", { line: lineNum, ch: 0 }, { line: lineNum + 1, ch: 0 });
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (!extractedText || !extractedText.trim()) {
+            new Notice("Selection is empty.");
+            return;
+        }
+
+        const finalFormatted = await this.formatOutput(extractedText, activeView);
+        await this.processTransfer(this.activeTargetHeading, finalFormatted);
+    }
+
+    async processTransfer(headingName: string, text: string): Promise<boolean> {
         let targetFile: TFile | null = null;
         if (this.settings.targetFilePath) {
-            const abstractFile = this.app.vault.getAbstractFileByPath(this.settings.targetFilePath);
-            if (abstractFile instanceof TFile) targetFile = abstractFile;
+            const f = this.app.vault.getAbstractFileByPath(this.settings.targetFilePath);
+            if (f instanceof TFile) targetFile = f;
         }
         if (!targetFile) targetFile = this.app.workspace.getActiveFile();
 
-        // 2. Logic Split: Same File vs Different File
-        const activeFile = this.app.workspace.getActiveFile();
-        const isSameFile = activeFile === targetFile;
-
-        if (isSameFile) {
-            // FIX: Handle index shifting internally
-            this.moveTextWithinCurrentEditor(editor, sourceLineNum, targetHeadingName, textToMove);
-        } else {
-            // Cross-file move
-            if (targetFile) {
-                const success = await this.insertIntoBackgroundFile(targetFile, targetHeadingName, textToMove);
-                if (success) {
-                    // Safe to delete local line as remote file didn't shift local indices
-                    editor.replaceRange(
-                        "", 
-                        { line: sourceLineNum, ch: 0 }, 
-                        { line: sourceLineNum + 1, ch: 0 }
-                    );
-                    this.fixCursorAfterDelete(editor, sourceLineNum);
-                }
-            } else {
-                new Notice("Target file not found.");
-            }
-        }
-    }
-
-    // --- Helper: Move text inside the SAME active editor ---
-    moveTextWithinCurrentEditor(editor: Editor, sourceLine: number, headingName: string, text: string) {
-        const file = this.app.workspace.getActiveFile();
-        const headings = this.getHeadings(file);
-        const targetHeading = headings.find(h => h.heading === headingName);
-
-        if (!targetHeading) {
-            new Notice(`Heading "${headingName}" not found.`);
-            return;
-        }
-
-        const targetIndex = headings.indexOf(targetHeading);
-        let insertLineIndex = -1;
-
-        if (targetIndex === headings.length - 1) {
-            insertLineIndex = editor.lineCount();
-        } else {
-            const nextHeading = headings[targetIndex + 1];
-            insertLineIndex = nextHeading.position.start.line;
-        }
-
-        // FIX FOR ANDROID/DESKTOP: Adjust delete index based on insert position
-        if (insertLineIndex <= sourceLine) {
-            // MOVING UP: Insert first, which pushes source down by 1
-            editor.replaceRange(text + "\n", { line: insertLineIndex, ch: 0 });
-            
-            const adjustedSourceLine = sourceLine + 1;
-            editor.replaceRange(
-                "", 
-                { line: adjustedSourceLine, ch: 0 }, 
-                { line: adjustedSourceLine + 1, ch: 0 }
-            );
-            
-            // Move cursor to the new location
-            editor.setCursor(insertLineIndex, 0); 
-        } 
-        else {
-            // MOVING DOWN: Insert after, source index remains valid
-            editor.replaceRange(text + "\n", { line: insertLineIndex, ch: 0 });
-
-            editor.replaceRange(
-                "", 
-                { line: sourceLine, ch: 0 }, 
-                { line: sourceLine + 1, ch: 0 }
-            );
-            
-            this.fixCursorAfterDelete(editor, sourceLine);
-        }
-
-        new Notice(`Moved to "${headingName}"`);
-    }
-
-    // --- Helper: Insert text (Clipboard or Cross-file) ---
-    async transferTextOnly(targetHeadingName: string, content: string): Promise<boolean> {
-        let targetFile: TFile | null = null;
-        
-        if (this.settings.targetFilePath) {
-            const abstractFile = this.app.vault.getAbstractFileByPath(this.settings.targetFilePath);
-            if (abstractFile instanceof TFile) targetFile = abstractFile;
-        }
-
-        if (!targetFile) {
-            targetFile = this.app.workspace.getActiveFile();
-        }
-
-        if (!targetFile) {
-            new Notice("No target file identified.");
-            return false;
-        }
-        
-        if(targetFile.extension !== 'md') {
+        if (!targetFile || targetFile.extension !== 'md') {
             new Notice("Target must be a Markdown file.");
             return false;
         }
 
-        const activeFile = this.app.workspace.getActiveFile();
-        const isSameFile = activeFile === targetFile;
-        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        let openEditor: Editor | null = null;
+        this.app.workspace.iterateAllLeaves(leaf => {
+            if (leaf.view instanceof MarkdownView && leaf.view.file.path === targetFile?.path) {
+                openEditor = leaf.view.editor;
+            }
+        });
 
-        if (isSameFile && activeView) {
-            return this.pasteIntoEditor(activeView.editor, targetHeadingName, content);
+        if (openEditor) {
+            return this.insertViaEditor(openEditor, targetFile, headingName, text);
         }
 
-        return this.insertIntoBackgroundFile(targetFile, targetHeadingName, content);
+        return this.insertViaVaultProcess(targetFile, headingName, text);
     }
 
-    // Simple paste, no deletions calculated
-    pasteIntoEditor(editor: Editor, headingName: string, text: string): boolean {
-        const file = this.app.workspace.getActiveFile();
-        const headings = this.getHeadings(file);
-        const targetHeading = headings.find(h => h.heading === headingName);
-
-        if (!targetHeading) {
-            new Notice(`Heading "${headingName}" not found.`);
-            return false;
-        }
-
-        const targetIndex = headings.indexOf(targetHeading);
-        let insertLineIndex = -1;
-
-        if (targetIndex === headings.length - 1) {
-            insertLineIndex = editor.lineCount(); 
-        } else {
-            const nextHeading = headings[targetIndex + 1];
-            insertLineIndex = nextHeading.position.start.line;
-        }
-
-        const insertPos = { line: insertLineIndex, ch: 0 };
+    insertViaEditor(editor: Editor, file: TFile, headingName: string, text: string): boolean {
+        const cache = this.app.metadataCache.getFileCache(file);
+        const headings = cache?.headings || [];
+        const targetIdx = headings.findIndex(h => h.heading === headingName);
         
-        if (insertLineIndex >= editor.lineCount()) {
-            editor.replaceRange("\n" + text, { line: editor.lineCount(), ch: 0 });
-        } else {
-            editor.replaceRange(text + "\n", insertPos);
-        }
+        if (targetIdx === -1) { new Notice(`Heading "${headingName}" not found.`); return false; }
+
+        const isLastHeading = targetIdx === headings.length - 1;
+        const insertLine = isLastHeading ? editor.lineCount() : headings[targetIdx + 1].position.start.line;
+
+        const content = `\n${text}\n`;
+        editor.replaceRange(content, { line: insertLine, ch: 0 });
         
-        new Notice(`Pasted to "${headingName}"`);
+        new Notice(`Added to "${headingName}"`);
         return true;
     }
 
-    async insertIntoBackgroundFile(file: TFile, headingName: string, text: string): Promise<boolean> {
-        const fileContent = await this.app.vault.read(file);
-        const headings = this.getHeadings(file); 
-        
-        const targetHeading = headings.find(h => h.heading === headingName);
-        if (!targetHeading) {
-            new Notice(`Heading "${headingName}" not found in target.`);
+    async insertViaVaultProcess(file: TFile, headingName: string, text: string): Promise<boolean> {
+        try {
+            await this.app.vault.process(file, (data) => {
+                const lines = data.split('\n');
+                const cache = this.app.metadataCache.getFileCache(file);
+                const headings = cache?.headings || [];
+                const targetIdx = headings.findIndex(h => h.heading === headingName);
+                
+                if (targetIdx === -1) throw new Error("Heading not found");
+
+                const isLastHeading = targetIdx === headings.length - 1;
+                const insertLine = isLastHeading ? lines.length : headings[targetIdx + 1].position.start.line;
+                
+                lines.splice(insertLine, 0, text);
+                return lines.join('\n');
+            });
+            new Notice(`Sent to "${file.basename}"`);
+            return true;
+        } catch (e) {
+            new Notice(e.message);
             return false;
         }
-
-        const lines = fileContent.split('\n');
-        const targetIndex = headings.indexOf(targetHeading);
-        
-        let insertLine = lines.length;
-
-        if (targetIndex < headings.length - 1) {
-            const nextHeading = headings[targetIndex + 1];
-            insertLine = nextHeading.position.start.line;
-        }
-
-        lines.splice(insertLine, 0, text);
-
-        await this.app.vault.modify(file, lines.join('\n'));
-        new Notice(`Sent to "${file.basename}"`);
-        return true;
     }
 
-    fixCursorAfterDelete(editor: Editor, deletedLine: number) {
-        const maxLines = editor.lineCount();
-        if (deletedLine >= maxLines) {
-             editor.setCursor(maxLines - 1, 0);
-        } else {
-            editor.setCursor(deletedLine, 0);
-        }
+    getHeadings(file: TFile | null): HeadingCache[] {
+        if (!file) return [];
+        return this.app.metadataCache.getFileCache(file)?.headings || [];
     }
 }
 
-/**
- * UI Class: The Floating Bar
- */
 class SortingFloatingBar {
     private plugin: TextSorterPlugin;
-    private app: App;
     public container: HTMLElement | null = null;
     private dropdown: HTMLSelectElement | null = null;
-    private targetNameDisplay: HTMLElement | null = null;
+    private label: HTMLSpanElement | null = null;
+    private moveBtn: HTMLButtonElement | null = null;
 
-    constructor(plugin: TextSorterPlugin) {
-        this.plugin = plugin;
-        this.app = plugin.app;
-    }
+    constructor(plugin: TextSorterPlugin) { this.plugin = plugin; }
 
-    public clearUI() {
-        if (this.container) {
-            this.container.remove();
-            this.container = null;
-        }
-        this.dropdown = null;
-    }
+    public clearUI() { this.container?.remove(); this.container = null; }
 
-    public async toggle(show: boolean, save: boolean = true) {
+    public async toggle(show: boolean, save = true) {
         this.clearUI();
         if (show) {
             this.createUI();
-            setTimeout(() => this.refreshHeadings(), 50);
+            this.refreshHeadings();
         }
         if (save) {
             this.plugin.settings.showFloatingBar = show;
@@ -349,253 +289,144 @@ class SortingFloatingBar {
         }
     }
 
-    public refreshHeadings() {
-        if (!this.dropdown || !this.targetNameDisplay) return;
-
-        let targetFile: TFile | null = null;
-        let isLocked = false;
-
-        if (this.plugin.settings.targetFilePath) {
-            const f = this.app.vault.getAbstractFileByPath(this.plugin.settings.targetFilePath);
-            if (f instanceof TFile) {
-                targetFile = f;
-                isLocked = true;
-            }
-        }
-
-        if (!targetFile) {
-            targetFile = this.app.workspace.getActiveFile();
-        }
-
-        if (targetFile) {
-            this.targetNameDisplay.setText(isLocked ? `🔒 ${targetFile.basename}` : `📄 ${targetFile.basename}`);
-            this.targetNameDisplay.style.color = isLocked ? 'var(--text-accent)' : 'var(--text-muted)';
-        } else {
-            this.targetNameDisplay.setText("No File");
-        }
-
-        this.dropdown.empty();
-
-        if (!targetFile || targetFile.extension !== 'md') {
-            this.dropdown.createEl('option', { text: '(Need .md file)', value: '' });
-            this.plugin.activeTargetHeading = null;
-            return;
-        }
-
-        const headings = this.plugin.getHeadings(targetFile);
-        
-        if (headings.length === 0) {
-            this.dropdown.createEl('option', { text: 'No Headings', value: '' });
-            this.plugin.activeTargetHeading = null;
-            return;
-        }
-
-        headings.forEach(h => {
-            const indent = "\u00A0".repeat((h.level - 1) * 2);
-            this.dropdown!.createEl('option', { 
-                text: `${indent}# ${h.heading}`, 
-                value: h.heading 
-            });
-        });
-
-        const currentSelection = this.plugin.activeTargetHeading;
-        if (currentSelection && headings.some(h => h.heading === currentSelection)) {
-            this.dropdown.value = currentSelection;
-        } else {
-            this.dropdown.selectedIndex = 0;
-            this.plugin.activeTargetHeading = this.dropdown.value;
-        }
-    }
-
     private createUI() {
-        this.container = document.body.createDiv({ cls: 'sorter-floating-bar' });
-
-        this.container.style.cssText = `
-            position: fixed; 
-            z-index: 15; 
-            background: var(--background-primary);
-            border: 1px solid var(--background-modifier-border); 
-            border-radius: 6px;
-            padding: 4px 8px; 
-            box-shadow: var(--shadow-s); 
-            display: flex; 
-            gap: 6px; 
-            align-items: center;
-            width: auto;
-            max-width: 90vw;
-            cursor: move; 
-            font-size: 0.8em;
-            user-select: none;
-        `;
-
-        this.applyInitialPosition(this.container);
-        this.setupContainerStylesAndDrag(this.container);
-
-        // 1. Lock Button
-        const lockBtn = this.container.createEl('button', {
-            text: '🎯',
-            attr: { 
-                style: 'padding: 2px 6px; background: transparent; border: 1px solid var(--background-modifier-border); flex-shrink: 0;' 
-            }
+        this.container = this.plugin.app.workspace.containerEl.createDiv({ cls: 'sorter-bar' });
+        Object.assign(this.container.style, {
+            position: 'absolute', zIndex: 'var(--layer-cover)',
+            left: `${this.plugin.settings.barLeft}px`, top: `${this.plugin.settings.barTop}px`,
+            background: 'var(--background-primary)', border: '1px solid var(--background-modifier-border)',
+            borderRadius: '8px', padding: '5px 10px', boxShadow: 'var(--shadow-l)', 
+            display: 'flex', gap: '8px', alignItems: 'center'
         });
-        lockBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const activeFile = this.app.workspace.getActiveFile();
-            if (this.plugin.settings.targetFilePath) {
-                this.plugin.settings.targetFilePath = null;
-                new Notice("Target unlocked");
-            } else if (activeFile && activeFile.extension === 'md') {
-                this.plugin.settings.targetFilePath = activeFile.path;
-                new Notice(`Locked: ${activeFile.basename}`);
-            } else {
-                new Notice("Select a Markdown file to lock.");
-            }
-            this.plugin.saveSettings();
+
+        const createBtn = (text: string, cb: () => void, cls = "") => {
+            const btn = this.container!.createEl('button', { text, cls });
+            btn.addEventListener('mousedown', (e) => { e.preventDefault(); cb(); });
+            btn.addEventListener('click', (e) => e.preventDefault());
+            return btn;
+        };
+
+        createBtn('🎯', async () => {
+            const active = this.plugin.app.workspace.getActiveFile();
+            this.plugin.settings.targetFilePath = this.plugin.settings.targetFilePath ? null : active?.path || null;
+            await this.plugin.saveSettings();
             this.refreshHeadings();
+            new Notice(this.plugin.settings.targetFilePath ? "Locked Target File" : "Targeting Active File");
         });
 
-        // 2. Label
-        this.targetNameDisplay = this.container.createSpan({ 
-            text: '...', 
-            attr: { style: 'font-weight: bold; max-width: 80px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; display: inline-block;' } 
-        });
+        this.label = this.container.createSpan({ attr: { style: 'font-size:0.8em; max-width:80px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' } });
+        this.dropdown = this.container.createEl('select');
+        this.dropdown.onchange = () => this.plugin.activeTargetHeading = this.dropdown!.value;
 
-        // 3. Dropdown
-        this.dropdown = this.container.createEl('select', {
-            cls: 'sorter-dropdown',
-            attr: { style: 'flex: 1; min-width: 60px; max-width: 150px;' }
-        });
-        this.dropdown.addEventListener('change', () => {
-            if (this.dropdown) this.plugin.activeTargetHeading = this.dropdown.value;
-        });
-        this.dropdown.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
-        this.dropdown.addEventListener('mousedown', (e) => e.stopPropagation());
+        this.moveBtn = createBtn('➤', () => this.plugin.handleTransfer('smart'), 'mod-cta') as HTMLButtonElement;
+        createBtn('📋', () => this.plugin.handleTransfer('clipboard'));
+        createBtn('×', () => this.toggle(false));
 
-        // 4. Send Button (The Move Logic)
-        const sendBtn = this.container.createEl('button', { 
-            text: '➤', 
-            attr: { 
-                style: 'padding: 2px 8px; background: var(--interactive-accent); color: var(--text-on-accent); border: none; border-radius: 3px; flex-shrink: 0;' 
-            } 
-        });
-        sendBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (view && this.plugin.activeTargetHeading) {
-                this.plugin.moveParagraphToHeadingName(view.editor, view, this.plugin.activeTargetHeading);
-            } else {
-                new Notice(view ? "No heading selected." : "Open Markdown file.");
-            }
-        });
-
-        // 5. Clipboard Button
-        const clipBtn = this.container.createEl('button', {
-            text: '📋',
-            attr: {
-                style: 'padding: 2px 8px; background: var(--background-secondary); border: 1px solid var(--background-modifier-border); border-radius: 3px; flex-shrink: 0;'
-            }
-        });
-        clipBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            if (this.plugin.activeTargetHeading) {
-                this.plugin.sendClipboardToHeading(this.plugin.activeTargetHeading);
-            } else {
-                new Notice("No target heading.");
-            }
-        });
-
-        // 6. Close Button
-        const closeBtn = this.container.createEl('button', {
-            text: '×',
-            attr: { 
-                style: 'background: transparent; border: none; color: var(--text-muted); font-size: 1.2em; line-height: 1; padding: 0 4px; margin-left: 2px; flex-shrink: 0;' 
-            }
-        });
-        closeBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.toggle(false);
-        });
+        this.setupDrag(this.container);
     }
 
-    private applyInitialPosition(container: HTMLElement) {
-        let left = this.plugin.settings.barLeft;
-        let top = this.plugin.settings.barTop;
+    public refreshHeadings() {
+        if (!this.dropdown || !this.label || !this.container || !this.moveBtn) return;
+
+        const activeLeaf = this.plugin.app.workspace.getMostRecentLeaf();
+        const viewType = activeLeaf?.view.getViewType();
+        const isValidView = ["markdown", "pdf", "web-viewer", "webviewer", "surfer-view"].includes(viewType);
+
+        if (!isValidView) { this.container.style.display = 'none'; return; } 
+        else { this.container.style.display = 'flex'; }
+
+        const isMarkdown = viewType === "markdown";
+        const isReadingMode = isMarkdown && (activeLeaf.view as MarkdownView).getMode() === "preview";
+        const hasSelection = isMarkdown && !isReadingMode && (activeLeaf.view as MarkdownView).editor.getSelection().length > 0;
+        const isNonEditable = ["pdf", "web-viewer", "webviewer", "surfer-view"].includes(viewType) || isReadingMode || hasSelection;
+
+        this.moveBtn.setText(isNonEditable ? "✨" : "➤");
+        this.moveBtn.title = isNonEditable ? "Send Selection" : "Move Current Line";
+
+        const targetPath = this.plugin.settings.targetFilePath;
+        const file = targetPath ? this.plugin.app.vault.getAbstractFileByPath(targetPath) : this.plugin.app.workspace.getActiveFile();
         
-        const viewportWidth = window.innerWidth;
-        const viewportHeight = window.innerHeight;
-
-        if (left > viewportWidth - 50) left = viewportWidth - 320;
-        if (top > viewportHeight - 50) top = viewportHeight - 100;
-        if (left < 0) left = 10;
-        if (top < 0) top = 10;
-
-        container.style.left = `${left}px`;
-        container.style.top = `${top}px`;
+        if (file instanceof TFile && file.extension === 'md') {
+            this.label.setText((targetPath ? "🔒 " : "📄 ") + file.basename);
+            const currentSelected = this.plugin.activeTargetHeading;
+            const headings = this.plugin.getHeadings(file);
+            this.dropdown.empty();
+            headings.forEach(h => {
+                const opt = this.dropdown!.createEl('option', { text: h.heading, value: h.heading });
+                if (h.heading === currentSelected) opt.selected = true;
+            });
+            this.plugin.activeTargetHeading = this.dropdown.value;
+        } else {
+            this.label.setText("No MD Target");
+            this.dropdown.empty();
+            this.plugin.activeTargetHeading = null;
+        }
     }
 
-    private setupContainerStylesAndDrag(container: HTMLElement) {
-        let isDragging = false;
-        let dragOffset = { x: 0, y: 0 };
-
-        const getEventCoords = (e: MouseEvent | TouchEvent) => {
-            if (e instanceof MouseEvent) return { x: e.clientX, y: e.clientY };
-            if (e.touches && e.touches.length > 0) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
-            return null;
+    private setupDrag(el: HTMLElement) {
+        let isDown = false, offset = [0, 0];
+        const onMouseDown = (e: MouseEvent) => {
+            if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLButtonElement) return;
+            isDown = true;
+            offset = [el.offsetLeft - e.clientX, el.offsetTop - e.clientY];
         };
-
-        const onDragStart = (e: MouseEvent | TouchEvent) => {
-            if ((e.target as HTMLElement).closest('select, button')) return;
-            if (e instanceof MouseEvent && e.button !== 0) return;
-
-            const coords = getEventCoords(e);
-            if (!coords) return;
-
-            isDragging = true;
-            const rect = container.getBoundingClientRect();
-            dragOffset = { x: coords.x - rect.left, y: coords.y - rect.top };
-            container.style.cursor = 'grabbing';
-            e.preventDefault(); 
-
-            if (e instanceof MouseEvent) {
-                document.addEventListener('mousemove', onDragMove);
-                document.addEventListener('mouseup', onDragEnd);
-            } else {
-                document.addEventListener('touchmove', onDragMove, { passive: false });
-                document.addEventListener('touchend', onDragEnd);
-            }
+        const onMouseMove = (e: MouseEvent) => {
+            if (!isDown) return;
+            el.style.left = (e.clientX + offset[0]) + 'px';
+            el.style.top = (e.clientY + offset[1]) + 'px';
         };
-
-        const onDragMove = (e: MouseEvent | TouchEvent) => {
-            if (!isDragging) return;
-            e.preventDefault(); 
-
-            const coords = getEventCoords(e);
-            if (!coords) return;
-
-            const x = coords.x - dragOffset.x;
-            const y = coords.y - dragOffset.y;
-
-            container.style.left = `${x}px`;
-            container.style.top = `${y}px`;
+        const onMouseUp = async () => {
+            if (!isDown) return;
+            isDown = false;
+            this.plugin.settings.barLeft = el.offsetLeft;
+            this.plugin.settings.barTop = el.offsetTop;
+            await this.plugin.saveSettings();
         };
+        this.plugin.registerDomEvent(el, 'mousedown', onMouseDown);
+        this.plugin.registerDomEvent(window, 'mousemove', onMouseMove);
+        this.plugin.registerDomEvent(window, 'mouseup', onMouseUp);
+    }
+}
 
-        const onDragEnd = () => {
-            if (!isDragging) return;
-            isDragging = false;
-            container.style.cursor = 'move';
+class TextSorterSettingTab extends PluginSettingTab {
+    plugin: TextSorterPlugin;
+    constructor(app: App, plugin: TextSorterPlugin) { super(app, plugin); this.plugin = plugin; }
 
-            const rect = container.getBoundingClientRect();
-            this.plugin.settings.barLeft = rect.left;
-            this.plugin.settings.barTop = rect.top;
-            this.plugin.saveSettings();
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+        containerEl.createEl('h2', { text: 'Formatting & Templates' });
 
-            document.removeEventListener('mousemove', onDragMove);
-            document.removeEventListener('mouseup', onDragEnd);
-            document.removeEventListener('touchmove', onDragMove);
-            document.removeEventListener('touchend', onDragEnd);
-        };
+        new Setting(containerEl)
+            .setName("Use Custom Appending Formats")
+            .setDesc("Apply the templates below to your text. Use {{text}} for the content.")
+            .addToggle(t => t.setValue(this.plugin.settings.useCustomFormatting).onChange(async v => { 
+                this.plugin.settings.useCustomFormatting = v; 
+                await this.plugin.saveSettings(); 
+            }));
 
-        container.addEventListener('mousedown', onDragStart);
-        container.addEventListener('touchstart', onDragStart, { passive: false });
+        new Setting(containerEl)
+            .setName("Markdown Template")
+            .setDesc("Variables: {{text}}, {{file}}")
+            .addTextArea(t => t.setValue(this.plugin.settings.mdTemplate).onChange(async v => { 
+                this.plugin.settings.mdTemplate = v; 
+                await this.plugin.saveSettings(); 
+            }));
+
+        new Setting(containerEl)
+            .setName("PDF Template")
+            .setDesc("Variables: {{text}}, {{file}}, {{page}}")
+            .addTextArea(t => t.setValue(this.plugin.settings.pdfTemplate).onChange(async v => { 
+                this.plugin.settings.pdfTemplate = v; 
+                await this.plugin.saveSettings(); 
+            }));
+
+        new Setting(containerEl)
+            .setName("Web Viewer Template")
+            .setDesc("Variables: {{text}}, {{url}}")
+            .addTextArea(t => t.setValue(this.plugin.settings.webTemplate).onChange(async v => { 
+                this.plugin.settings.webTemplate = v; 
+                await this.plugin.saveSettings(); 
+            }));
     }
 }
