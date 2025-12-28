@@ -8,7 +8,7 @@ Text Sorter is a productivity tool for Obsidian designed to help you quickly org
 - **Smart Context Detection**:
     - **Markdown**: Moves the current line or the selected text.
     - **PDF**: Extracts selected text and automatically includes the page number.
-    - **Web Viewer**: Extracts selections from web views (like Surfer) and includes the source URL.
+    - **Web Viewer**: Extracts selections from web views  and includes the source URL.
 - **Target Locking**: Click the 🎯 icon to "lock" a specific note as the destination. This allows you to browse multiple sources while funneling all highlights into a single research note.
 - **Custom Templates**: Define exactly how your snippets appear using placeholders:
     - `{{text}}`: The content being moved.
@@ -39,4 +39,5 @@ Text Sorter is a productivity tool for Obsidian designed to help you quickly org
 ## Installation
 
 1. Copy `main.js`, `manifest.json`, and `styles.css` (if applicable) to your vault's `.obsidian/plugins/obsidian-text-sorter/` folder.
+
 2. Enable the plugin in Obsidian settings.
